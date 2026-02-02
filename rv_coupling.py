@@ -65,15 +65,22 @@ class RVCouplingAnalyzer:
             window_dpdt = dpdt[window_slice]
             
             # dP/dt max (Start of Ejection)
+            if len(window_dpdt) == 0:
+                continue
             dpdt_max_loc = np.argmax(window_dpdt) + start_search
             
             # dP/dt min (End of Ejection)
             dpdt_min_loc = np.argmin(window_dpdt) + start_search
             
-            # Start of beat (EDP) - usually start of upstroke, slightly before dP/dt max
-            # We can look for zero-crossing of dP/dt or local min pressure before dP/dt max
-            pre_eject_slice = slice(max(0, dpdt_max_loc - int(0.15*self.fs)), dpdt_max_loc)
-            beat_start = np.argmin(pressure[pre_eject_slice]) + pre_eject_slice.start
+            # Start of beat (EDP)
+            pre_eject_start = max(0, dpdt_max_loc - int(0.15*self.fs))
+            pre_eject_end = dpdt_max_loc
+            
+            if pre_eject_end > pre_eject_start:
+                 beat_start = np.argmin(pressure[pre_eject_start:pre_eject_end]) + pre_eject_start
+            else:
+                 # Fallback if too close to start
+                 beat_start = max(0, dpdt_max_loc - 10)
             
             # P_max location
             p_max_loc = p_idx
@@ -88,11 +95,14 @@ class RVCouplingAnalyzer:
             
         return beats
 
-    def calculate_single_beat_ees(self, pressure_segment, beat_info):
+    def estimate_pmax_isovolumic(self, pressure_segment, beat_info):
         """
-        Calculate Ees using the single-beat method (Weibull fit).
+        Estimate theoretical max isovolumic pressure (Pmax) using Weibull fit.
         pressure_segment: numpy array of pressure for the beat
         beat_info: dict with indices relative to the segment
+        
+        Returns:
+            float: Pmax (mmHg)
         """
         # Implementation of the Chen/Oakland method
         # 1. Normalize time and amplitude
@@ -104,7 +114,14 @@ class RVCouplingAnalyzer:
         # This refers to the SECOND DERIVATIVE squared peaks.
         
         # Let's compute second derivative squared
-        p_smooth = signal.savgol_filter(pressure_segment, 11, 3) # Smooth slightly
+        if len(pressure_segment) >= 11:
+            p_smooth = signal.savgol_filter(pressure_segment, 11, 3) # Smooth slightly
+        elif len(pressure_segment) > 3:
+            # Fallback for very short segments: use smaller window (must be odd)
+            win_len = len(pressure_segment) if len(pressure_segment) % 2 == 1 else len(pressure_segment) - 1
+            p_smooth = signal.savgol_filter(pressure_segment, win_len, 3) if win_len > 3 else pressure_segment
+        else:
+            p_smooth = pressure_segment
         d1 = np.gradient(p_smooth)
         d2 = np.gradient(d1)
         d2_sq = d2**2
@@ -297,5 +314,120 @@ class RVCouplingAnalyzer:
             zc_sec_units = zc_hybrid
             
             lambda_val = (tpr_sec_units - zc_sec_units) / (tpr_sec_units + zc_sec_units)
-
+            
         return zc_hybrid, lambda_val
+
+
+
+def compute_wedge_empirical(time, pap, tzero_time, t_end=None, fs=100.0, window_size=20, n_points=20):
+    """
+    Computes Empirical Wedge Pressure as the mean of the N lowest SMOOTHED values 
+    after tzero, optionally bounded by t_end.
+    
+    Args:
+        time (array): Time array.
+        pap (array): Raw Pressure array.
+        tzero_time (float): Occlusion start time.
+        t_end (float): Optional end time for the search window.
+        fs (float): Sampling frequency.
+        window_size (int): Smoothing window size (default 20).
+        n_points (int): Number of lowest points to average (default 20).
+        
+    Returns:
+        float: The calculated Wedge Pressure.
+    """
+    # 1. Smooth the signal (same method as compute_pcap)
+    if len(pap) < window_size:
+        return 0.0
+        
+    # Simple moving average
+    kernel = np.ones(window_size) / window_size
+    pap_smooth = np.convolve(pap, kernel, mode='same')
+    
+    # 2. Slice from tzero onwards (and up to t_end)
+    if t_end is not None:
+        mask = (time >= tzero_time) & (time <= t_end)
+    else:
+        mask = time >= tzero_time
+        
+    p_segment = pap_smooth[mask]
+    
+    if len(p_segment) < n_points:
+        return np.mean(p_segment) if len(p_segment) > 0 else 0.0
+    
+    # 3. Find N lowest values
+    lowest_n = np.sort(p_segment)[:n_points]
+    
+    # 4. Average
+    wedge_val = np.mean(lowest_n)
+    
+    return wedge_val
+
+
+def compute_pcap(time, pap, tzero_time, fs=100.0):
+    """
+    Computes Pcap using an exponential decay fit: P(t) = a * exp(-b * t) + c.
+    Pcap is defined as the pressure value on the fitted curve at t = 95ms (0.095s) post-occlusion.
+    
+    Fit Window: [tzero + 0.3s, tzero + 2.0s]
+    """
+    # 1. Define window for FITTING (0.3s to 2.0s after tzero)
+    fit_start = tzero_time + 0.3
+    fit_end = tzero_time + 2.0
+    
+    mask_fit = (time >= fit_start) & (time <= fit_end)
+    t_fit = time[mask_fit]
+    p_fit = pap[mask_fit]
+    
+    if len(t_fit) < 10:
+        return {'fit_success': False, 'message': 'Not enough data in fit window (0.3-2.0s)'}
+
+    # 2. Smooth data for fitting (optional but helps stability)
+    window_size = 20
+    kernel = np.ones(window_size) / window_size
+    pap_smooth = np.convolve(pap, kernel, mode='same')
+    p_fit_smooth = pap_smooth[mask_fit]
+    
+    # 3. Formulate relative time
+    t_rel = t_fit - tzero_time
+    
+    # 4. Fit Exponential: a * exp(-b * t) + c
+    def exp_decay(t, a, b, c):
+        return a * np.exp(-b * t) + c
+    
+    # Initial Guess
+    p_max = np.max(p_fit_smooth)
+    p_min = np.min(p_fit_smooth)
+    p_range = p_max - p_min
+    
+    p0 = [p_range, 1.0, p_min] # a, b, c estimate
+    
+    # Bounds: a>0, b>0, c>0 roughly
+    bounds = ([0, 0, -np.inf], [np.inf, np.inf, np.inf])
+    
+    try:
+        popt, pcov = curve_fit(exp_decay, t_rel, p_fit_smooth, p0=p0, bounds=bounds, maxfev=1000)
+        a, b, c = popt
+        
+        # Calculate R-squared
+        residuals = p_fit_smooth - exp_decay(t_rel, *popt)
+        ss_res = np.sum(residuals**2)
+        ss_tot = np.sum((p_fit_smooth - np.mean(p_fit_smooth))**2)
+        r_squared = 1 - (ss_res / ss_tot)
+        
+        # 5. Calculate Pcap at t = 95ms (0.095s)
+        t_target = 0.095
+        pcap_val = a * np.exp(-b * t_target) + c
+        
+        return {
+            'fit_success': True,
+            'pcap': pcap_val,
+            'params': (a, b, c),
+            'r_squared': r_squared,
+            'time_rel': t_rel, # Return for plotting
+            'pap_smooth': pap_smooth, # Return full smoothed for plotting
+            'fit_func': exp_decay # Not strictly needed if we return params
+        }
+        
+    except Exception as e:
+        return {'fit_success': False, 'message': str(e)}
