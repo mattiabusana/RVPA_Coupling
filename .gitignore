@@ -3,6 +3,7 @@
 
 # Whitelist specific project files
 !app.py
+!pcap_annotator_app.py
 !rv_coupling.py
 !test_rv_coupling.py
 !RV_PA_COUPLING_README.md

@@ -129,6 +129,7 @@ def plot_full_curve_selector(time, signal, title, key_prefix, selection_mode="bo
         title=title, 
         xaxis_title="Time (s)", 
         yaxis_title="Pressure", 
+        xaxis=dict(nticks=30, tickformat=".2f"),
         margin=dict(l=0,r=0,t=40,b=0),
         dragmode=drag_mode,
         clickmode=click_mode,
@@ -298,6 +299,8 @@ elif st.session_state.step == 2:
     
     if 'pcap_zoom_window' not in st.session_state:
         st.session_state.pcap_zoom_window = None
+    if 'confirmed_tzero' not in st.session_state:
+        st.session_state.confirmed_tzero = None
 
     # --- STAGE 1: ZOOM SELECTION ---
     if st.session_state.pcap_zoom_window is None:
@@ -316,6 +319,7 @@ elif st.session_state.step == 2:
                     st.error("Invalid selection.")
                 else:
                     st.session_state.pcap_zoom_window = (s_zoom, e_zoom)
+                    st.session_state.confirmed_tzero = None
                     st.rerun()
 
     # --- STAGE 2: PINPOINT TZERO ---
@@ -336,13 +340,22 @@ elif st.session_state.step == 2:
             
             dyn_key = f"pcap_stage2_{int(s_base)}"
             master_key_start = f"{dyn_key}_start"
+            candidate_key = f"{dyn_key}_tzero_candidate"
+            confirmed_key = f"{dyn_key}_tzero_confirmed"
             
             if 'pending_ts_update' in st.session_state:
                 update_val = st.session_state.pop('pending_ts_update')
                 st.session_state[master_key_start] = float(update_val)
             
             s_click, _ = plot_full_curve_selector(t_view, p_view, "Zoomed Occlusion", dyn_key, selection_mode="points")
-            tzero = s_click
+            tzero_candidate = float(s_click)
+            prev_candidate = st.session_state.get(candidate_key)
+            st.session_state[candidate_key] = tzero_candidate
+            if prev_candidate is not None and abs(prev_candidate - tzero_candidate) > 1e-9:
+                # New click invalidates previous confirmation, forcing explicit re-confirm.
+                st.session_state[confirmed_key] = None
+                st.session_state.confirmed_tzero = None
+            tzero = tzero_candidate
             
             # CALCULATION
             fit_res = compute_pcap(t_pa, p_pa, tzero_time=tzero)
@@ -354,6 +367,7 @@ elif st.session_state.step == 2:
             
             if fit_res['fit_success']:
                 pcap_calc = fit_res['pcap']
+                pcap_95 = fit_res.get('pcap_95ms', np.nan)
                 r2 = fit_res['r_squared']
                 a, b, c = fit_res['params']
                 final_pcap = pcap_calc
@@ -367,15 +381,26 @@ elif st.session_state.step == 2:
                      p_view_smooth = full_smooth[mask_d]
                      fig_z.add_trace(go.Scatter(x=t_view, y=p_view_smooth, mode='lines', name='Smoothed', line=dict(color='blue', width=1)))
                 
-                t_fit_abs = tzero + fit_res['time_rel']
-                p_fit_curve = a * np.exp(-b * fit_res['time_rel']) + c
+                # Extend interpolation back to t0 so the fitted line reaches the Pcap point.
+                t_rel_fit = fit_res['time_rel']
+                if len(t_rel_fit) > 0 and t_rel_fit[0] > 0:
+                    t_rel_plot = np.insert(t_rel_fit, 0, 0.0)
+                else:
+                    t_rel_plot = t_rel_fit
+                t_fit_abs = tzero + t_rel_plot
+                p_fit_curve = a * np.exp(-b * t_rel_plot) + c
                 fig_z.add_trace(go.Scatter(x=t_fit_abs, y=p_fit_curve, mode='lines', name='Exp Fit', line=dict(color='red', width=3)))
                 
                 fig_z.add_hline(y=wedge_val, line_dash="dot", line_color="orange", annotation_text="Pwedge")
                 fig_z.add_vline(x=tzero, line_dash="dash", line_color="green", annotation_text="tzero")
-                fig_z.add_trace(go.Scatter(x=[tzero + 0.095], y=[pcap_calc], mode='markers', marker=dict(color='red', size=12, symbol='star'), name='Pcap (95ms)'))
+                fig_z.add_trace(go.Scatter(x=[tzero], y=[pcap_calc], mode='markers', marker=dict(color='red', size=12, symbol='star'), name='Pcap (t0)'))
 
-                fig_z.update_layout(title="Interactive Fit", height=450, margin=dict(l=0,r=0,t=40,b=0))
+                fig_z.update_layout(
+                    title="Interactive Fit",
+                    height=450,
+                    xaxis=dict(nticks=35, tickformat=".2f"),
+                    margin=dict(l=0,r=0,t=40,b=0),
+                )
                 
                 pres_key = f"{dyn_key}_result_plot"
                 event_res = st.plotly_chart(fig_z, use_container_width=True, on_select="rerun", selection_mode="points", key=pres_key)
@@ -396,16 +421,36 @@ elif st.session_state.step == 2:
             # Manual Override
             if st.checkbox("Override Pcap?", key="ovr_pcap"):
                  final_pcap = st.number_input("Manual Value", value=float(final_pcap))
+
+            c_ok, c_reset = st.columns([1, 1])
+            with c_ok:
+                if st.button("OK - Confirm T0"):
+                    st.session_state[confirmed_key] = tzero_candidate
+                    st.session_state.confirmed_tzero = tzero_candidate
+            with c_reset:
+                if st.button("Clear T0 Confirmation"):
+                    st.session_state[confirmed_key] = None
+                    st.session_state.confirmed_tzero = None
+
+            confirmed_tzero = st.session_state.get(confirmed_key)
+            if confirmed_tzero is not None:
+                st.success(f"T0 confirmed at {confirmed_tzero:.3f} s")
+            else:
+                st.warning("T0 not confirmed yet. Click on the curve, inspect fit, then press 'OK - Confirm T0'.")
             
             # --- HEMODYNAMICS ---
             st.write("---")
             c_res, c_co = st.columns([2, 1])
             with c_res:
                  st.subheader("Wedge Fit Results")
-                 c1, c2, c3 = st.columns(3)
+                 c1, c2, c3, c4 = st.columns(4)
                  c1.metric("Pcap (Fit)", f"{final_pcap:.2f}")
                  c2.metric("Wedge (Empirical)", f"{wedge_val:.2f}")
                  c3.metric("R²", f"{r2:.3f}")
+                 if fit_res.get('fit_success') and np.isfinite(pcap_95):
+                     c4.metric("Pcap (95ms)", f"{pcap_95:.2f}")
+                 else:
+                     c4.metric("Pcap (95ms)", "N/A")
             with c_co:
                 st.subheader("Hemodynamics Input")
 
@@ -432,6 +477,8 @@ elif st.session_state.step == 2:
                 mpap = st.session_state.data['mpap']
                 p_sys = st.session_state.data.get('p_sys', 0)
                 p_dia = st.session_state.data.get('p_dia', 0)
+                if final_pcap >= p_dia and p_dia > 0:
+                    st.warning(f"Pcap ({final_pcap:.1f}) >= diastolic PAP ({p_dia:.1f}). Check t0/fit.")
                 
                 # PVR = (mPAP - Wedge) / CO
                 rv_loading_grad = (mpap - wedge_val)
@@ -471,15 +518,26 @@ elif st.session_state.step == 2:
             with c1:
                 if st.button("Reset Zoom", key="rst_zm"):
                     st.session_state.pcap_zoom_window = None
+                    st.session_state.confirmed_tzero = None
                     st.rerun()
             with c2:
                 if st.button("Confirm & Next (Save Pcap)"):
-                    st.session_state.data['mpawp'] = final_pcap # Save Pcap as the reference for Ees calc? Or Wedge?
+                    confirmed_tzero = st.session_state.get(confirmed_key)
+                    if confirmed_tzero is None:
+                        st.error("Confirm T0 first using 'OK - Confirm T0'.")
+                        st.stop()
+
+                    fit_res_save = compute_pcap(t_pa, p_pa, tzero_time=confirmed_tzero)
+                    wedge_save = compute_wedge_empirical(t_pa, p_pa, tzero_time=confirmed_tzero, t_end=e_base, n_points=20)
+                    pcap_save = fit_res_save['pcap'] if fit_res_save.get('fit_success') else wedge_save
+
+                    st.session_state.data['tzero'] = confirmed_tzero
+                    st.session_state.data['mpawp'] = pcap_save # Save Pcap as the reference for Ees calc? Or Wedge?
                     # Usually Ees uses Pes. Ea uses Pes/SV.
                     # Zc/Lambda might use mPAP.
                     # Wedge is useful for PVR. 
                     # Let's save both?
-                    st.session_state.data['p_wedge_empirical'] = wedge_val
+                    st.session_state.data['p_wedge_empirical'] = wedge_save
                     st.session_state.data['co_val'] = co_val
                     st.session_state.step = 3
                     st.rerun()

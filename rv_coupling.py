@@ -1,4 +1,5 @@
 import numpy as np
+import pandas as pd
 import scipy.signal as signal
 from scipy.optimize import curve_fit
 
@@ -366,68 +367,105 @@ def compute_wedge_empirical(time, pap, tzero_time, t_end=None, fs=100.0, window_
 
 def compute_pcap(time, pap, tzero_time, fs=100.0):
     """
-    Computes Pcap using an exponential decay fit: P(t) = a * exp(-b * t) + c.
-    Pcap is defined as the pressure value on the fitted curve at t = 95ms (0.095s) post-occlusion.
-    
-    Fit Window: [tzero + 0.3s, tzero + 2.0s]
+    Compute Pcap using the same logic used in the reference notebook/R workflow.
+    Core points:
+    - smooth PAP with moving window (rolling mean, window=20)
+    - discard the first 50 samples after smoothing
+    - fit exp decay on [tzero+0.3s, tzero+2.0s]
+    - fit is done on scaled pressure and sample index (not absolute time)
+    - Pcap is evaluated at tzero (pcap_0)
     """
-    # 1. Define window for FITTING (0.3s to 2.0s after tzero)
-    fit_start = tzero_time + 0.3
-    fit_end = tzero_time + 2.0
-    
-    mask_fit = (time >= fit_start) & (time <= fit_end)
-    t_fit = time[mask_fit]
-    p_fit = pap[mask_fit]
-    
-    if len(t_fit) < 10:
-        return {'fit_success': False, 'message': 'Not enough data in fit window (0.3-2.0s)'}
+    time = np.asarray(time, dtype=float)
+    pap = np.asarray(pap, dtype=float)
+    if len(time) < 70 or len(pap) < 70:
+        return {'fit_success': False, 'message': 'Not enough samples for pcap computation'}
 
-    # 2. Smooth data for fitting (optional but helps stability)
-    window_size = 20
-    kernel = np.ones(window_size) / window_size
-    pap_smooth = np.convolve(pap, kernel, mode='same')
-    p_fit_smooth = pap_smooth[mask_fit]
-    
-    # 3. Formulate relative time
-    t_rel = t_fit - tzero_time
-    
-    # 4. Fit Exponential: a * exp(-b * t) + c
+    # Infer sampling rate from time vector when possible.
+    fs_local = fs
+    dt = np.diff(time)
+    dt = dt[np.isfinite(dt) & (dt > 0)]
+    if len(dt) > 0:
+        fs_local = 1.0 / np.median(dt)
+
+    # Exact smoothing style used in notebook: rolling mean (window=20).
+    pap_smooth = pd.Series(pap).rolling(window=20, min_periods=20).mean().to_numpy()
+
+    # Match notebook preprocessing.
+    trim_n = 50
+    t_proc = time[trim_n:]
+    p_proc = pap_smooth[trim_n:]
+    valid = np.isfinite(t_proc) & np.isfinite(p_proc)
+    t_proc = t_proc[valid]
+    p_proc = p_proc[valid]
+    if len(t_proc) < 20:
+        return {'fit_success': False, 'message': 'Not enough valid smoothed points after trim'}
+
+    # tzero from absolute time to processed index.
+    tzero_idx = int(np.argmin(np.abs(t_proc - float(tzero_time))))
+    tzero_proc_time = float(t_proc[tzero_idx])
+
+    # Fit window in sample offsets.
+    offset_1 = int(0.3 * fs_local)
+    offset_2 = int(2.0 * fs_local)
+    t1_idx = tzero_idx + offset_1
+    t2_idx = tzero_idx + offset_2
+    if t1_idx < 0 or t2_idx >= len(p_proc) or t2_idx <= t1_idx:
+        return {'fit_success': False, 'message': 'Fit window out of signal bounds'}
+
+    p_fit_vals = p_proc[t1_idx : t2_idx + 1]
+    if len(p_fit_vals) < 10:
+        return {'fit_success': False, 'message': 'Not enough points in fit window (0.3-2.0s)'}
+
+    max_pap = np.nanmax(p_fit_vals)
+    if not np.isfinite(max_pap) or max_pap <= 0:
+        return {'fit_success': False, 'message': 'Invalid fit scaling factor'}
+    p_scaled = p_fit_vals / max_pap
+    time_fit_vals = np.arange(1, len(p_fit_vals) + 1, dtype=float)
+
+    # Fit in sample domain as in notebook.
     def exp_decay(t, a, b, c):
         return a * np.exp(-b * t) + c
-    
-    # Initial Guess
-    p_max = np.max(p_fit_smooth)
-    p_min = np.min(p_fit_smooth)
-    p_range = p_max - p_min
-    
-    p0 = [p_range, 1.0, p_min] # a, b, c estimate
-    
-    # Bounds: a>0, b>0, c>0 roughly
-    bounds = ([0, 0, -np.inf], [np.inf, np.inf, np.inf])
-    
+
     try:
-        popt, pcov = curve_fit(exp_decay, t_rel, p_fit_smooth, p0=p0, bounds=bounds, maxfev=1000)
-        a, b, c = popt
-        
-        # Calculate R-squared
-        residuals = p_fit_smooth - exp_decay(t_rel, *popt)
+        popt, _ = curve_fit(
+            exp_decay,
+            time_fit_vals,
+            p_scaled,
+            p0=[0.5, 0.01, 0.4],
+            bounds=([0, 0, 0], [10, 1.0, 5]),
+            maxfev=10000,
+        )
+        a_fit, b_fit, c_fit = popt
+
+        # Back-scale parameters; convert decay constant to 1/seconds for plotting usage.
+        a = a_fit * max_pap
+        b = b_fit * fs_local
+        c = c_fit * max_pap
+
+        # R^2 on scaled fit domain.
+        residuals = p_scaled - exp_decay(time_fit_vals, a_fit, b_fit, c_fit)
         ss_res = np.sum(residuals**2)
-        ss_tot = np.sum((p_fit_smooth - np.mean(p_fit_smooth))**2)
-        r_squared = 1 - (ss_res / ss_tot)
-        
-        # 5. Calculate Pcap at t = 95ms (0.095s)
-        t_target = 0.095
-        pcap_val = a * np.exp(-b * t_target) + c
-        
+        ss_tot = np.sum((p_scaled - np.mean(p_scaled))**2)
+        r_squared = 1 - (ss_res / ss_tot) if ss_tot > 0 else np.nan
+
+        # Reference output: pcap at tzero.
+        pcap_val = a + c
+        pcap_95ms = a * np.exp(-b * 0.095) + c
+
+        # Keep returned time axis compatible with existing plotting code.
+        t_fit_abs = t_proc[t1_idx : t2_idx + 1]
+        t_rel = t_fit_abs - tzero_proc_time
+
         return {
             'fit_success': True,
             'pcap': pcap_val,
+            'pcap_95ms': pcap_95ms,
             'params': (a, b, c),
             'r_squared': r_squared,
-            'time_rel': t_rel, # Return for plotting
-            'pap_smooth': pap_smooth, # Return full smoothed for plotting
-            'fit_func': exp_decay # Not strictly needed if we return params
+            'time_rel': t_rel,
+            'pap_smooth': pap_smooth,
+            'fit_func': exp_decay
         }
-        
+
     except Exception as e:
         return {'fit_success': False, 'message': str(e)}
