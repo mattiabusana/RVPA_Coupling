@@ -219,15 +219,29 @@ if len(t_pa) > 1:
 else:
     step_t = 0.01
 
-t0_candidate = st.slider(
-    "T0 candidate (s)",
-    min_value=float(t_pa[0]),
-    max_value=float(t_pa[-1]),
-    value=float(np.clip(st.session_state.t0_candidate, float(t_pa[0]), float(t_pa[-1]))),
-    step=step_t,
-)
+t0_slider, t0_exact = st.columns([3, 2])
+with t0_slider:
+    t0_candidate_slider = st.slider(
+        "T0 candidate (s)",
+        min_value=float(t_pa[0]),
+        max_value=float(t_pa[-1]),
+        value=float(np.clip(st.session_state.t0_candidate, float(t_pa[0]), float(t_pa[-1]))),
+        step=step_t,
+    )
+with t0_exact:
+    t0_candidate_exact = st.number_input(
+        "T0 exact (s)",
+        min_value=float(t_pa[0]),
+        max_value=float(t_pa[-1]),
+        value=float(t0_candidate_slider),
+        step=max(0.0001, step_t / 10.0),
+        format="%.6f",
+    )
+
+# The exact numeric input wins when edited; slider remains for coarse moves.
+t0_candidate = float(t0_candidate_exact)
 if abs(t0_candidate - float(st.session_state.t0_candidate)) > 1e-12:
-    st.session_state.t0_candidate = float(t0_candidate)
+    st.session_state.t0_candidate = t0_candidate
     st.session_state.t0_confirmed = None
 
 fit_res = compute_pcap(t_pa, p_pa, tzero_time=float(st.session_state.t0_candidate))
