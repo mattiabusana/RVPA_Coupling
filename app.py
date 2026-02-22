@@ -6,7 +6,12 @@ import scipy.signal as signal
 import importlib
 import rv_coupling
 importlib.reload(rv_coupling)
-from rv_coupling import RVCouplingAnalyzer, compute_pcap, compute_wedge_empirical
+from rv_coupling import (
+    RVCouplingAnalyzer,
+    auto_detect_cvp_rv_windows,
+    compute_pcap,
+    compute_wedge_empirical,
+)
 
 # --- Configuration & State ---
 st.set_page_config(page_title="RV-PA Coupling Wizard", layout="wide")
@@ -550,8 +555,31 @@ elif st.session_state.step == 3:
     
     t_full = st.session_state.data['t_rv_full']
     p_full = st.session_state.data['p_rv_full']
-    
-    st.info("Select the segment containing the RV beats to analyze.")
+
+    auto_split = auto_detect_cvp_rv_windows(t_full, p_full, sampling_rate=sampling_rate)
+    if auto_split is not None:
+        st.session_state.data['mcvp_auto'] = auto_split.get('mcvp', np.nan)
+        st.session_state.data['cvp_window_auto'] = auto_split.get('cvp_time_window', None)
+        st.session_state.data['rv_window_auto'] = auto_split.get('rv_time_window', None)
+
+        # Pre-fill the manual selector with the auto-detected RV region only if the user
+        # has not already moved the controls in this session.
+        rv_key_start = "rv_beats_start"
+        rv_key_end = "rv_beats_end"
+        if rv_key_start not in st.session_state or rv_key_end not in st.session_state:
+            rv_tw = auto_split.get('rv_time_window')
+            if rv_tw is not None:
+                st.session_state[rv_key_start] = float(rv_tw[0])
+                st.session_state[rv_key_end] = float(rv_tw[1])
+
+        c_auto1, c_auto2, c_auto3 = st.columns(3)
+        cvp_tw = auto_split.get('cvp_time_window')
+        rv_tw = auto_split.get('rv_time_window')
+        c_auto1.metric("Auto mCVP", f"{auto_split.get('mcvp', np.nan):.2f}")
+        c_auto2.caption(f"Auto CVP window: {cvp_tw[0]:.2f}-{cvp_tw[1]:.2f}s" if cvp_tw else "Auto CVP window: N/A")
+        c_auto3.caption(f"Auto RV window: {rv_tw[0]:.2f}-{rv_tw[1]:.2f}s" if rv_tw else "Auto RV window: N/A")
+
+    st.info("Select the segment containing the RV beats to analyze (auto-suggested from the combined CVP+RV trace).")
     s_rv, e_rv = plot_full_curve_selector(t_full, p_full, "RV Signal (Sheet 2)", "rv_beats")
     
     mask_rv = (t_full >= s_rv) & (t_full <= e_rv)
@@ -579,6 +607,7 @@ elif st.session_state.step == 3:
                     st.session_state.data['beats'] = beats
                     st.session_state.data['p_rv_segment'] = p_seg
                     st.session_state.data['t_rv_segment'] = t_seg
+                    st.session_state.data['mcvp'] = st.session_state.data.get('mcvp_auto', np.nan)
                     st.session_state.step = 4
                     st.rerun()
                 else:

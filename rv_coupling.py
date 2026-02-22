@@ -38,6 +38,133 @@ def weibull_4_param(x, a, x0, b, c):
     except:
         return np.zeros_like(x)
 
+
+def auto_detect_cvp_rv_windows(time, pressure, sampling_rate=100.0):
+    """
+    Heuristic split of a combined CVP+RV pressure trace into:
+    - a low-amplitude CVP baseline window
+    - a high-amplitude RV beat window
+    Returns a dict with index/time windows and a CVP estimate.
+    """
+    time = np.asarray(time, dtype=float)
+    pressure = np.asarray(pressure, dtype=float)
+    if len(time) != len(pressure) or len(pressure) < 30:
+        return None
+
+    valid = np.isfinite(time) & np.isfinite(pressure)
+    time = time[valid]
+    pressure = pressure[valid]
+    if len(pressure) < 30:
+        return None
+
+    dt = np.diff(time)
+    dt = dt[np.isfinite(dt) & (dt > 0)]
+    fs = float(sampling_rate)
+    if len(dt) > 0:
+        fs = float(1.0 / np.median(dt))
+
+    # Light smoothing for amplitude/peak heuristics only (not for final beat fit).
+    if len(pressure) >= 11:
+        p_smooth = signal.savgol_filter(pressure, 11, 2)
+    else:
+        p_smooth = pressure.copy()
+
+    win = max(12, int(2.0 * fs))
+    step = max(1, int(0.25 * fs))
+    if len(pressure) <= win:
+        return {
+            "cvp_idx_window": (0, max(1, len(pressure) - 1)),
+            "rv_idx_window": (0, max(1, len(pressure) - 1)),
+            "cvp_time_window": (float(time[0]), float(time[-1])),
+            "rv_time_window": (float(time[0]), float(time[-1])),
+            "mcvp": float(np.percentile(pressure, 25)),
+            "fs_est": fs,
+        }
+
+    stats = []
+    for start in range(0, len(pressure) - win + 1, step):
+        end = start + win
+        y = p_smooth[start:end]
+        amp = float(np.percentile(y, 95) - np.percentile(y, 5))
+        mean_y = float(np.mean(y))
+        prom = max(0.5, amp * 0.15)
+        peaks, _ = signal.find_peaks(y, prominence=prom, distance=max(1, int(0.2 * fs)))
+        stats.append(
+            {
+                "start": start,
+                "end": end,
+                "amp": amp,
+                "mean": mean_y,
+                "n_peaks": int(len(peaks)),
+            }
+        )
+
+    if not stats:
+        return None
+
+    amps = np.array([s["amp"] for s in stats], dtype=float)
+    means = np.array([s["mean"] for s in stats], dtype=float)
+    peak_counts = np.array([s["n_peaks"] for s in stats], dtype=float)
+
+    # CVP: low-amplitude, low-pressure, stable segment.
+    cvp_scores = amps + 0.15 * np.maximum(means, 0.0)
+    cvp_idx = int(np.argmin(cvp_scores))
+    cvp_stat = stats[cvp_idx]
+    cvp_amp = float(cvp_stat["amp"])
+    cvp_mask = slice(cvp_stat["start"], cvp_stat["end"])
+    mcvp = float(np.mean(pressure[cvp_mask]))
+
+    # RV: high pulsatility with repeated peaks.
+    amp_thr = max(5.0, np.percentile(amps, 70), cvp_amp * 3.0)
+    peak_thr = 2 if win < int(2.5 * fs) else 3
+    is_rv_win = (amps >= amp_thr) & (peak_counts >= peak_thr)
+
+    if not np.any(is_rv_win):
+        # Fallback: pick strongest pulsatile window
+        rv_idx = int(np.argmax(amps))
+        rv_stat = stats[rv_idx]
+        rv_start = rv_stat["start"]
+        rv_end = rv_stat["end"]
+    else:
+        # Merge contiguous positive windows and choose the longest/highest-amplitude block.
+        rv_blocks = []
+        block_start = None
+        block_end = None
+        block_amp = []
+        for i, flag in enumerate(is_rv_win):
+            if flag:
+                if block_start is None:
+                    block_start = stats[i]["start"]
+                block_end = stats[i]["end"]
+                block_amp.append(stats[i]["amp"])
+            elif block_start is not None:
+                rv_blocks.append((block_start, block_end, float(np.mean(block_amp))))
+                block_start = None
+                block_end = None
+                block_amp = []
+        if block_start is not None:
+            rv_blocks.append((block_start, block_end, float(np.mean(block_amp))))
+
+        # Prefer longer blocks, then higher amplitude.
+        rv_blocks.sort(key=lambda b: ((b[1] - b[0]), b[2]), reverse=True)
+        rv_start, rv_end, _ = rv_blocks[0]
+
+        # Pad slightly so beat detection catches boundaries.
+        pad = int(0.5 * fs)
+        rv_start = max(0, rv_start - pad)
+        rv_end = min(len(pressure) - 1, rv_end + pad)
+
+    return {
+        "cvp_idx_window": (int(cvp_stat["start"]), int(cvp_stat["end"] - 1)),
+        "rv_idx_window": (int(rv_start), int(rv_end)),
+        "cvp_time_window": (float(time[int(cvp_stat["start"])]), float(time[int(cvp_stat["end"] - 1)])),
+        "rv_time_window": (float(time[int(rv_start)]), float(time[int(rv_end)])),
+        "mcvp": mcvp,
+        "fs_est": fs,
+        "cvp_amp": cvp_amp,
+        "rv_amp_threshold": float(amp_thr),
+    }
+
 class RVCouplingAnalyzer:
     def __init__(self, sampling_rate=100.0):
         self.fs = sampling_rate

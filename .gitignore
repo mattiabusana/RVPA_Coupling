@@ -5,6 +5,7 @@
 !app.py
 !pcap_annotator_app.py
 !rv_coupling.py
+!batch_auto_analyze.py
 !test_rv_coupling.py
 !RV_PA_COUPLING_README.md
 !requirements.txt
